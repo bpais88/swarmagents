@@ -59,13 +59,4 @@ def run_graph():
     builder.add_node("calendar", calendar_node)
     builder.add_node("crm", crm_node)
 
-    builder.add_edge("coordinator", "calendar")
-    builder.add_edge("coordinator", "crm")
-
-    builder.add_edge("calendar", END)
-    builder.add_edge("crm", END)
-
-    graph = builder.compile()
-    graph.invoke({})
-
-    return report
+ 
