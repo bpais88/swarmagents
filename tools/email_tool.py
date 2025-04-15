@@ -1,0 +1,1 @@
+class EmailTool:\n    def read_email(self):\n        return {\n            'from': 'lead@example.com',\n            'subject': 'Interested in your product',\n            'body': 'I\'d like to schedule a call.'\n        }\n

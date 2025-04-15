@@ -1,0 +1,1 @@
+class CRMTool:\n    def log(self, lead_info):\n        return f'CRM updated with lead from {lead_info["from"]}.'\n

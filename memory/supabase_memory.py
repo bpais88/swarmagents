@@ -1,0 +1,1 @@
+class SupabaseMemory:\n    def __init__(self):\n        self._store = {}\n    def set(self, key, value):\n        self._store[key] = value\n    def get(self, key):\n        return self._store.get(key)\nmemory = SupabaseMemory()\n
