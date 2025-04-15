@@ -1,14 +1,20 @@
-
 from langgraph.graph import StateGraph, END
 from memory.supabase_memory import memory
 from tools.email_tool import EmailTool
 from tools.calendar_tool import CalendarTool
-from tools.crm_tool import CRMTool
+from tools.hubspot_tool import HubSpotCRMTool
 from utils.llm import llm_think
+from typing import TypedDict
+
+# Define the state structure
+class GraphState(TypedDict):
+    lead_email: str
+    calendar_done: bool
+    crm_done: bool
 
 email_tool = EmailTool()
 calendar_tool = CalendarTool()
-crm_tool = CRMTool()
+crm_tool = HubSpotCRMTool()
 
 def run_graph():
     report = {"thoughts": [], "tools_used": [], "tokens": 0}
@@ -34,25 +40,27 @@ def run_graph():
 
     def crm_node(state):
         lead = memory.get("lead")
+    
+    # 🛠️ Run the actual tool (HubSpot)
         result = crm_tool.log(lead)
-        report["tools_used"].append("CRMTool.log")
         memory.set("crm_log", result)
-        thought, tokens = llm_think(f"Log the following lead into the CRM: {lead}")
+        report["tools_used"].append("CRMTool.log")
+
+    # 🧠 Optional: have the LLM reflect on what was logged
+        thought, tokens = llm_think(f"The CRM tool returned the following result:\n\n{result}")
         report["thoughts"].append(f"[CRM Agent] {thought}")
         report["tokens"] += tokens
+
         return {"crm_done": True}
 
-    builder = StateGraph()
+    builder = StateGraph(GraphState)
     builder.set_entry_point("coordinator")
     builder.add_node("coordinator", coordinator_node)
     builder.add_node("calendar", calendar_node)
     builder.add_node("crm", crm_node)
 
-    builder.add_conditional_edges(
-        "coordinator",
-        lambda _: "fork",
-        {"fork": ["calendar", "crm"]}
-    )
+    builder.add_edge("coordinator", "calendar")
+    builder.add_edge("coordinator", "crm")
 
     builder.add_edge("calendar", END)
     builder.add_edge("crm", END)

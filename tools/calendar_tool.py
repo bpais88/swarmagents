@@ -1,1 +1,3 @@
-class CalendarTool:\n    def schedule(self, email):\n        return f'Meeting scheduled with {email} at 2025-04-16 15:00.'\n
+class CalendarTool:
+    def schedule(self, email):
+        return f"Meeting scheduled with {email} at 2025-04-16 15:00."
