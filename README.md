@@ -1,14 +1,14 @@
-# 🧠 Lindy-Style Swarm of AI Agents
+# 🧠 Swarm of AI Agents
 
 This project is a production-ready example of a multi-agent orchestration system using LangGraph, Streamlit, and real-world tools (like HubSpot CRM). It demonstrates how to build a modular swarm of AI agents that analyze emails, schedule meetings, and log interactions in CRMs — all with clear observability and extendability.
 
 ---
 
-## 🚀 Features
+## ✨ Features
 - LangGraph for flexible stateful agent orchestration
 - Modular tool/agent architecture inspired by CrewAI
 - Real LLM-powered thought generation (GPT-4)
-- Streamlit frontend for triggering and observing agent workflows
+- Streamlit frontend with dynamic input for lead messages and agent rules
 - Real HubSpot CRM integration with upsert logic
 - Agent memory (mock or extendable to Supabase)
 - Console-based observability of tools, thoughts, and token usage
@@ -19,7 +19,7 @@ This project is a production-ready example of a multi-agent orchestration system
 
 ```bash
 .
-├── app.py                      # Streamlit frontend
+├── app.py                      # Streamlit frontend (with input form)
 ├── orchestrator/
 │   └── graph.py               # LangGraph definition + run_graph()
 ├── tools/
@@ -69,9 +69,21 @@ streamlit run app.py
 - **Calendar Agent**: Schedules a meeting based on email
 - **CRM Agent**: Logs the lead into HubSpot with contact & note (and upsert support)
 
-### Memory
-- In-memory `SupabaseMemory` mock implementation
-- Easily extendable to real Supabase KV store or database logging
+### Dynamic Inputs
+The user can provide:
+- The lead email
+- A custom rule that defines what counts as a qualified lead
+
+These inputs are merged into the LLM prompt:
+```python
+prompt = f"""
+Use the following rule to decide if this is a qualified lead:
+{lead_rule}
+
+Here is the email:
+{lead_text}
+"""
+```
 
 ---
 
