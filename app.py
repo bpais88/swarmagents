@@ -39,24 +39,26 @@ if reset_oauth == "true":
     logging.info("OAuth state has been reset.")
     st.stop()
 
-# 🔐 OAuth credentials from .env
+# OAuth credentials from .env
 CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
-REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
-SCOPE = "https://www.googleapis.com/auth/calendar"
-TOKEN_URL = "https://oauth2.googleapis.com/token"
+REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8501")
 
-# 🚧 Sanity check logging
+# Use the actual Streamlit URL to handle port changes
+ACTUAL_REDIRECT_URI = f"http://localhost:{st.get_option('server.port')}"
+
+# Sanity check logging
 logging.info(f"Client ID: {CLIENT_ID}")
-logging.info(f"Redirect URI: {REDIRECT_URI}")
+logging.info(f"Configured Redirect URI: {REDIRECT_URI}")
+logging.info(f"Actual Streamlit Redirect URI: {ACTUAL_REDIRECT_URI}")
 
 # Step 1: Construct OAuth URL
 def get_auth_url():
     params = urlencode({
         "client_id": CLIENT_ID,
-        "redirect_uri": REDIRECT_URI,
+        "redirect_uri": ACTUAL_REDIRECT_URI,
         "response_type": "code",
-        "scope": SCOPE,
+        "scope": "https://www.googleapis.com/auth/calendar",
         "access_type": "offline",
         "prompt": "consent",
         "include_granted_scopes": "true"
@@ -70,17 +72,17 @@ code = st.query_params.get("code")
 
 # Check if we already have a valid access token in session
 if st.session_state.oauth_complete and st.session_state.access_token:
-    st.success("✅ Google Calendar is connected!")
+    st.success("Google Calendar is connected!")
     st.info("You can now use the agent workflow below.")
 elif not code:
     st.markdown("### Connect your Google Calendar")
     auth_link = get_auth_url()
     col1, col2 = st.columns([3, 1])
     with col1:
-        st.link_button("🔐 Authorize Google Calendar", auth_link)
+        st.link_button("Authorize Google Calendar", auth_link)
     with col2:
-        reset_url = f"{REDIRECT_URI}?reset=true"
-        st.link_button("🔄 Reset Auth", reset_url)
+        reset_url = f"{ACTUAL_REDIRECT_URI}?reset=true"
+        st.link_button("Reset Auth", reset_url)
     logging.info("Waiting for user to authorize via Google")
     st.stop()
 elif not st.session_state.oauth_complete:
@@ -97,7 +99,7 @@ elif not st.session_state.oauth_complete:
         "code": code,
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
-        "redirect_uri": REDIRECT_URI,
+        "redirect_uri": ACTUAL_REDIRECT_URI,
         "grant_type": "authorization_code",
     }
 
@@ -106,11 +108,11 @@ elif not st.session_state.oauth_complete:
         "Content-Type": "application/x-www-form-urlencoded"
     }
 
-    logging.info(f"Token exchange data: client_id={CLIENT_ID[:8]}..., redirect_uri={REDIRECT_URI}")
+    logging.info(f"Token exchange data: client_id={CLIENT_ID[:8]}..., redirect_uri={ACTUAL_REDIRECT_URI}")
 
     try:
         # Make token exchange request with proper headers
-        token_response = requests.post(TOKEN_URL, data=token_data, headers=headers)
+        token_response = requests.post("https://oauth2.googleapis.com/token", data=token_data, headers=headers)
         
         if token_response.status_code != 200:
             st.error("Failed to exchange token with Google.")
@@ -151,11 +153,14 @@ lead_rule = st.text_input(
     value="Consider it a lead if the sender asks for a meeting, demo, or pricing."
 )
 
-if st.button("🚀 Run Agent Workflow") and lead_text:
+if st.button("Run Agent Workflow") and lead_text:
     with st.spinner("Running agents..."):
         report = run_graph(email_body=lead_text, lead_rule=lead_rule, access_token=st.session_state.access_token)
 
     st.success("Workflow completed!")
+    
+    # DEBUG: Print report structure
+    st.json(report)
 
     st.subheader("Agent Thoughts")
     for thought in report["thoughts"]:
@@ -176,7 +181,121 @@ if st.button("🚀 Run Agent Workflow") and lead_text:
         st.markdown("_No reply was generated._")
 
     if "meeting" in report:
-        st.subheader("📅 Meeting Confirmation")
+        st.subheader("Meeting Confirmation")
         st.markdown(report["meeting"])
+        
+        # Display detailed calendar events for debugging
+        if "event_details" in report and report["event_details"]:
+            st.subheader("Your Calendar Events")
+            
+            st.markdown("""
+            The agent checked your Google Calendar for the next few days to find the best meeting time.
+            Below are all the events in your calendar that were considered during scheduling.
+            """)
+            
+            # Create tabs for each checked date
+            date_tabs = st.tabs([date_info["formatted_date"] for date_str, date_info in sorted(report["event_details"].items())])
+            
+            for i, (date_str, date_info) in enumerate(sorted(report["event_details"].items())):
+                with date_tabs[i]:
+                    formatted_date = date_info["formatted_date"]
+                    events = date_info["events"]
+                    
+                    if events:
+                        # Create a colorful table of events
+                        event_table = """
+                        <table style="width:100%; border-collapse: collapse;">
+                            <tr style="background-color: #f0f0f0;">
+                                <th style="padding: 8px; text-align: left; border: 1px solid #ddd;">Event</th>
+                                <th style="padding: 8px; text-align: left; border: 1px solid #ddd;">Time</th>
+                                <th style="padding: 8px; text-align: left; border: 1px solid #ddd;">Type</th>
+                            </tr>
+                        """
+                        
+                        for j, event in enumerate(events):
+                            # Alternate row colors
+                            row_color = "#f9f9f9" if j % 2 == 0 else "white"
+                            # Highlight full-day events
+                            if event["is_full_day"]:
+                                row_color = "#ffdddd"  # Light red for full-day events
+                                time_str = "All day"
+                                event_type = "Full-day event"
+                            else:
+                                time_str = f"{event['start']} to {event['end']}"
+                                event_type = "Timed event"
+                                
+                            event_table += f"""
+                            <tr style="background-color: {row_color};">
+                                <td style="padding: 8px; text-align: left; border: 1px solid #ddd;">{event['title']}</td>
+                                <td style="padding: 8px; text-align: left; border: 1px solid #ddd;">{time_str}</td>
+                                <td style="padding: 8px; text-align: left; border: 1px solid #ddd;">{event_type}</td>
+                            </tr>
+                            """
+                            
+                        event_table += "</table>"
+                        st.markdown(event_table, unsafe_allow_html=True)
+                        
+                        # Highlight if this is the chosen meeting date
+                        if formatted_date == report.get("meeting_date"):
+                            if any(event["is_full_day"] for event in events):
+                                st.warning("This date has full-day events that may conflict with your meeting.")
+                            else:
+                                st.success("Meeting scheduled on this day in a free time slot between the events above.")
+                    else:
+                        st.markdown(f"No events found in your calendar for {formatted_date}.")
+                        if formatted_date == report.get("meeting_date"):
+                            st.success("Meeting scheduled on this day as your calendar was completely free.")
+            
+            # Overall explanation
+            selected_date = report.get("meeting_date", "")
+            if selected_date:
+                st.info(f"Based on this calendar analysis, the agent selected **{selected_date}** for your meeting.")
+        
+        # Legacy display based on busy slots
+        elif "all_checked_dates" in report and report["all_checked_dates"]:
+            st.subheader("Calendar Availability Analysis")
+            
+            st.markdown("""
+            The agent checked your Google Calendar availability for the next few days to find the best meeting time.
+            Below are all the dates that were analyzed, with your busy time slots shown for each day.
+            """)
+            
+            # Create tabs for each checked date
+            date_tabs = st.tabs([date_info["formatted_date"] for date_str, date_info in sorted(report["all_checked_dates"].items())])
+            
+            for i, (date_str, date_info) in enumerate(sorted(report["all_checked_dates"].items())):
+                with date_tabs[i]:
+                    formatted_date = date_info["formatted_date"]
+                    busy_slots = date_info["busy_slots"]
+                    
+                    if busy_slots:
+                        st.markdown(f"**Busy time slots on {formatted_date}:**")
+                        for j, slot in enumerate(busy_slots, 1):
+                            st.markdown(f"**Event {j}:** {slot['start']} to {slot['end']}")
+                        
+                        # Highlight if this is the chosen meeting date
+                        if formatted_date == report.get("meeting_date"):
+                            st.success("Meeting scheduled on this day in a free time slot that avoids the conflicts above.")
+                    else:
+                        st.markdown(f"No events found in your calendar for {formatted_date}.")
+                        if formatted_date == report.get("meeting_date"):
+                            st.success("Meeting scheduled on this day as your calendar was completely free.")
+            
+            # Overall explanation
+            selected_date = report.get("meeting_date", "")
+            if selected_date:
+                st.info(f"Based on this analysis, the agent selected **{selected_date}** as the best day for your meeting.")
+        
+        # Extremely basic legacy display
+        elif "busy_slots" in report and report["busy_slots"]:
+            st.subheader("Busy Calendar Events")
+            st.markdown(f"These are the busy events found in the calendar for **{report.get('meeting_date', 'the requested day')}**:")
+            
+            for i, slot in enumerate(report["busy_slots"], 1):
+                st.markdown(f"**Event {i}:** {slot['start']} to {slot['end']}")
+            
+            st.info("The agent scheduled your meeting in a free time slot avoiding these busy periods.")
+        elif "busy_slots" in report:
+            st.markdown("No conflicting events were found in your calendar for the requested date.")
 else:
     st.warning("Please enter a lead email to run the workflow.")
