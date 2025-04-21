@@ -2,24 +2,28 @@ from langgraph.graph import StateGraph, END
 from memory.supabase_memory import memory
 from tools.email_tool import EmailTool
 from tools.calendar_tool import CalendarTool
-from tools.hubspot_tool import HubSpotCRMTool
+from tools.google_calendar_tool import GoogleCalendarOAuthTool
 from utils.llm import llm_think
 from typing import TypedDict
+import json
+import datetime
+import pytz
+import os
 
 # Define the state structure
 class GraphState(TypedDict):
     lead_message: str
     lead_rule: str
     calendar_done: bool
-    crm_done: bool
     reply_done: bool
 
 email_tool = EmailTool()
 calendar_tool = CalendarTool()
-crm_tool = HubSpotCRMTool()
 
-def run_graph(email_body: str, lead_rule: str):
+
+def run_graph(email_body: str, lead_rule: str, access_token: str):
     report = {"thoughts": [], "tools_used": [], "tokens": 0}
+    calendar_api = GoogleCalendarOAuthTool(access_token=access_token)
 
     def coordinator_node(state):
         email = {
@@ -45,24 +49,67 @@ Here is the message from the lead:
         }
 
     def calendar_node(state):
-        email = state["lead_message"]
-        result = calendar_tool.schedule(email)
-        report["tools_used"].append("CalendarTool.schedule")
-        memory.set("meeting", result)
-        thought, tokens = llm_think(f"Meeting confirmation for {email}: {result}")
+        lead = memory.get("lead")
+        lead_msg = state["lead_message"]
+
+        raw_json = calendar_tool.schedule(lead_msg)
+        try:
+            data = json.loads(raw_json)
+            preferred_time = datetime.datetime.strptime(data["datetime"], "%A, %B %d, %Y at %I:%M %p")
+            preferred_time = preferred_time.replace(tzinfo=pytz.utc)
+            mode = data.get("mode", "online")
+            subject = data.get("subject", "AI project discussion")
+        except Exception as e:
+            report["thoughts"].append(f"[Calendar Agent] Failed to parse meeting data: {e}")
+            return {"calendar_done": False}
+
+        busy_slots = calendar_api.get_busy_slots(preferred_time.date())
+
+        print("\n📅 Busy slots for", preferred_time.date())
+        for slot in busy_slots:
+            print(f" - {slot['start']} to {slot['end']}")
+
+        free_slot = calendar_api.find_next_free_slot(
+            preferred_start=preferred_time,
+            duration_minutes=30,
+            busy_slots=busy_slots
+        )
+
+        if not free_slot:
+            report["thoughts"].append("[Calendar Agent] No available time slots found.")
+            return {"calendar_done": False}
+
+        print(f"✅ Found free slot: {free_slot}")
+
+        event_link = calendar_api.create_event(
+            summary=subject,
+            description=f"Meeting ({mode}) with lead about: {subject}",
+            start_time=free_slot,
+            location="Zoom" if mode == "online" else "Office HQ – Lisbon"
+        )
+
+        confirmation = f"""Subject: Meeting Confirmation
+
+Dear [Customer's Name],
+
+I am writing to confirm our {mode} meeting about: '{subject}'.  
+The meeting is scheduled for {free_slot.strftime("%A, %B %d, %Y at %I:%M %p")}.
+
+If this time does not work for you, feel free to suggest an alternative.
+
+📅 View Calendar Invite: {event_link}
+
+Looking forward to it!
+
+Best regards,  
+[Your Name]"""
+
+        memory.set("meeting", confirmation)
+        report["tools_used"].append("CalendarTool.schedule + GoogleCalendarTool.create_event")
+        thought, tokens = llm_think(f"Meeting confirmation for {lead['from']}:\n\n{confirmation}")
         report["thoughts"].append(f"[Calendar Agent] {thought}")
         report["tokens"] += tokens
         return {"calendar_done": True}
-
-    def crm_node(state):
-        lead = memory.get("lead")
-        result = crm_tool.log(lead)
-        report["tools_used"].append("CRMTool.log")
-        memory.set("crm_log", result)
-        thought, tokens = llm_think(f"The CRM tool returned the following result:\n\n{result}")
-        report["thoughts"].append(f"[CRM Agent] {thought}")
-        report["tokens"] += tokens
-        return {"crm_done": True}
 
     def reply_node(state):
         lead = memory.get("lead")
@@ -82,14 +129,11 @@ Assume you are a sales assistant responding to a potential customer interested i
     builder.set_entry_point("coordinator")
     builder.add_node("coordinator", coordinator_node)
     builder.add_node("calendar", calendar_node)
-    builder.add_node("crm", crm_node)
     builder.add_node("reply", reply_node)
 
     builder.add_edge("coordinator", "calendar")
-    builder.add_edge("coordinator", "crm")
     builder.add_edge("coordinator", "reply")
     builder.add_edge("calendar", END)
-    builder.add_edge("crm", END)
     builder.add_edge("reply", END)
 
     graph = builder.compile()

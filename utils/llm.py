@@ -19,7 +19,7 @@ if "OPENAI_API_KEY" in os.environ:
     del os.environ["OPENAI_API_KEY"]
 
 # First try loading with dotenv
-load_dotenv(dotenv_path=env_path)
+load_dotenv()
 
 # Get the API key
 api_key = os.getenv("OPENAI_API_KEY")
