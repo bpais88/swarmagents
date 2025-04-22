@@ -69,6 +69,9 @@ Here is the message from the lead:
             mode = data.get("mode", "online")
             subject = data.get("subject", "AI project discussion")
             has_specific_date_request = data.get("has_specific_date_request", False)
+            
+            # Get the date intent type from the LLM
+            date_intent_type = data.get("date_intent_type", "")
         except Exception as e:
             report["thoughts"].append(f"[Calendar Agent] Failed to parse meeting data: {e}")
             return {"calendar_done": False}
@@ -78,19 +81,139 @@ Here is the message from the lead:
         
         # If there's a specific date request, we should respect it
         if has_specific_date_request:
-            report["thoughts"].append(f"[Calendar Agent] Customer requested a specific date/time: {preferred_time.strftime('%A, %B %d, %Y at %I:%M %p %Z')}")
+            report["thoughts"].append(f"[Calendar Agent] Customer has a specific date request: {date_intent_type}")
             
-            # Start checking from the requested date
-            start_date = preferred_time.date()
-            report["thoughts"].append(f"[Calendar Agent] Prioritizing the requested date: {start_date.strftime('%A, %B %d, %Y')}")
+            # Determine start date based on intent type
+            if date_intent_type == "today":
+                start_date = now.date()
+                report["thoughts"].append(f"[Calendar Agent] 'Today' requested. Checking from {start_date.strftime('%A, %B %d, %Y')}")
+            
+            elif date_intent_type == "tomorrow":
+                start_date = now.date() + timedelta(days=1)
+                report["thoughts"].append(f"[Calendar Agent] 'Tomorrow' requested. Checking from {start_date.strftime('%A, %B %d, %Y')}")
+            
+            elif date_intent_type == "this_week":
+                # Start from today or tomorrow if today is almost over
+                if now.hour >= 17:  # After 5pm, start from tomorrow
+                    start_date = now.date() + timedelta(days=1)
+                else:
+                    start_date = now.date()
+                report["thoughts"].append(f"[Calendar Agent] 'This week' requested. Checking from {start_date.strftime('%A, %B %d, %Y')}")
+            
+            elif date_intent_type == "end_of_week":
+                # Calculate Thursday or Friday of this week
+                today_weekday = now.weekday()
+                if today_weekday <= 3:  # Mon-Wed
+                    # Check if Thursday has full-day events
+                    thursday_date = now.date() + timedelta(days=3 - today_weekday)
+                    thursday_events = calendar_api.get_events(thursday_date)
+                    thursday_has_full_day = any(event["is_full_day"] for event in thursday_events)
+                    
+                    # Check if Friday has full-day events
+                    friday_date = now.date() + timedelta(days=4 - today_weekday)
+                    friday_events = calendar_api.get_events(friday_date)
+                    friday_has_full_day = any(event["is_full_day"] for event in friday_events)
+                    
+                    if thursday_has_full_day and friday_has_full_day:
+                        # Both Thursday and Friday have full-day events, start from next Monday
+                        days_until_next_monday = (7 - today_weekday) % 7
+                        start_date = now.date() + timedelta(days=days_until_next_monday)
+                        report["thoughts"].append(f"[Calendar Agent] Both Thursday and Friday have full-day events, suggesting next week instead: {start_date.strftime('%A, %B %d, %Y')}")
+                    elif thursday_has_full_day:
+                        # Thursday has full-day events, start from Friday
+                        start_date = friday_date
+                        report["thoughts"].append(f"[Calendar Agent] Thursday has full-day events, checking from Friday: {start_date.strftime('%A, %B %d, %Y')}")
+                    else:
+                        # Start from Thursday
+                        start_date = thursday_date
+                        report["thoughts"].append(f"[Calendar Agent] Checking from Thursday for 'end of week': {start_date.strftime('%A, %B %d, %Y')}")
+                elif today_weekday == 4:  # Thursday
+                    # Check if Thursday (today) has full-day events
+                    thursday_events = calendar_api.get_events(now.date())
+                    thursday_has_full_day = any(event["is_full_day"] for event in thursday_events)
+                    
+                    # Check if Friday has full-day events
+                    friday_date = now.date() + timedelta(days=1)
+                    friday_events = calendar_api.get_events(friday_date)
+                    friday_has_full_day = any(event["is_full_day"] for event in friday_events)
+                    
+                    if thursday_has_full_day and friday_has_full_day:
+                        # Both Thursday and Friday have full-day events, start from next Monday
+                        days_until_next_monday = 4  # Monday is 4 days from Thursday
+                        start_date = now.date() + timedelta(days=days_until_next_monday)
+                        report["thoughts"].append(f"[Calendar Agent] Both Thursday and Friday have full-day events, suggesting next week instead: {start_date.strftime('%A, %B %d, %Y')}")
+                    elif thursday_has_full_day:
+                        # Thursday has full-day events, start from Friday
+                        start_date = friday_date
+                        report["thoughts"].append(f"[Calendar Agent] Today (Thursday) has full-day events, checking from Friday: {start_date.strftime('%A, %B %d, %Y')}")
+                    else:
+                        # Start from today (Thursday)
+                        start_date = now.date()
+                        report["thoughts"].append(f"[Calendar Agent] Checking from today (Thursday) for 'end of week': {start_date.strftime('%A, %B %d, %Y')}")
+                else:  # Fri-Sun, check next week
+                    days_until_next_thursday = (10 - today_weekday) % 7
+                    next_thursday = now.date() + timedelta(days=days_until_next_thursday)
+                    next_friday = next_thursday + timedelta(days=1)
+                    
+                    # Check if next Thursday has full-day events
+                    thursday_events = calendar_api.get_events(next_thursday)
+                    thursday_has_full_day = any(event["is_full_day"] for event in thursday_events)
+                    
+                    # Check if next Friday has full-day events
+                    friday_events = calendar_api.get_events(next_friday)
+                    friday_has_full_day = any(event["is_full_day"] for event in friday_events)
+                    
+                    if thursday_has_full_day and friday_has_full_day:
+                        # Both next Thursday and Friday have full-day events
+                        # Suggest Monday after next
+                        days_until_monday_after_next = (14 - today_weekday) % 7
+                        start_date = now.date() + timedelta(days=days_until_monday_after_next)
+                        report["thoughts"].append(f"[Calendar Agent] Both next Thursday and Friday have full-day events, suggesting the week after: {start_date.strftime('%A, %B %d, %Y')}")
+                    elif thursday_has_full_day:
+                        # Next Thursday has full-day events, start from next Friday
+                        start_date = next_friday
+                        report["thoughts"].append(f"[Calendar Agent] Next Thursday has full-day events, checking from next Friday: {start_date.strftime('%A, %B %d, %Y')}")
+                    else:
+                        # Start from next Thursday
+                        start_date = next_thursday
+                        report["thoughts"].append(f"[Calendar Agent] 'End of week' requested after weekend. Checking from next Thursday: {start_date.strftime('%A, %B %d, %Y')}")
+                
+                # Add a warning about full-day events to the report
+                if thursday_has_full_day or friday_has_full_day:
+                    report["thoughts"].append(f"[Calendar Agent] Warning: Full-day events detected for end of week.")
+            
+            elif date_intent_type == "weekend":
+                # Calculate coming Saturday
+                today_weekday = now.weekday()
+                days_until_saturday = (5 - today_weekday) % 7
+                start_date = now.date() + timedelta(days=days_until_saturday)
+                report["thoughts"].append(f"[Calendar Agent] 'Weekend' requested. Checking from {start_date.strftime('%A, %B %d, %Y')}")
+            
+            elif date_intent_type == "next_week":
+                # Calculate next Monday
+                days_until_next_monday = (7 - now.weekday()) % 7
+                if days_until_next_monday == 0:
+                    days_until_next_monday = 7  # If today is Monday, go to next Monday
+                start_date = now.date() + timedelta(days=days_until_next_monday)
+                report["thoughts"].append(f"[Calendar Agent] 'Next week' requested. Checking from {start_date.strftime('%A, %B %d, %Y')}")
+            
+            elif date_intent_type == "specific_day" or date_intent_type == "specific_date":
+                # Use the LLM suggested date
+                start_date = preferred_time.date()
+                report["thoughts"].append(f"[Calendar Agent] Specific date ({start_date.strftime('%A, %B %d, %Y')}) requested.")
+            
+            else:
+                # For any other intent type or custom date references, use LLM's suggestion
+                start_date = preferred_time.date()
+                report["thoughts"].append(f"[Calendar Agent] Using LLM suggested date: {start_date.strftime('%A, %B %d, %Y')}")
         else:
-            # Calculate next Monday for "next week" scheduling
+            # Default to next week if no specific date was requested
             days_until_next_monday = (7 - now.weekday()) % 7
             if days_until_next_monday == 0:
                 days_until_next_monday = 7  # If today is Monday, go to next Monday
             next_monday = now.date() + timedelta(days=days_until_next_monday)
             
-            # Start checking from next Monday, not from today
+            # Start checking from next Monday
             start_date = next_monday
             report["thoughts"].append(f"[Calendar Agent] No specific date requested, defaulting to next week starting: {start_date.strftime('%A, %B %d, %Y')}")
         

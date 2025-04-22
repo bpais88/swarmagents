@@ -2,45 +2,72 @@ from utils.llm import llm_think
 from datetime import datetime, timedelta
 import logging
 import pytz
-import re
+import json
 
 class CalendarTool:
-    def detect_date_intent(self, message):
+    def extract_date_intent(self, message: str):
         """
-        Detect if the message contains a specific date request like 'tomorrow', 'today', etc.
-        Returns a tuple (has_date_intent, intent_type, date_reference)
+        Use the LLM to extract date and time preferences from the message.
+        This is more robust than regex patterns for handling natural language and multiple languages.
         """
-        message = message.lower()
+        # Use CET timezone explicitly
+        cet_timezone = pytz.timezone('Europe/Paris')
+        now = datetime.now(cet_timezone)
+        today = now.strftime("%A, %B %d, %Y")
+        tomorrow = (now + timedelta(days=1)).strftime("%A, %B %d, %Y")
         
-        # Check for common date references
-        tomorrow_patterns = [r'\btomorrow\b', r'\bnext day\b']
-        today_patterns = [r'\btoday\b', r'\bthis day\b']
-        this_week_patterns = [r'\bthis week\b', r'\bcurrent week\b']
-        specific_day_patterns = [
-            r'\bmonday\b', r'\btuesday\b', r'\bwednesday\b', 
-            r'\bthursday\b', r'\bfriday\b', r'\bsaturday\b', r'\bsunday\b'
-        ]
+        # Calculate next Monday for "next week" reference
+        days_until_next_monday = (7 - now.weekday()) % 7
+        if days_until_next_monday == 0:
+            days_until_next_monday = 7  # If today is Monday, go to next Monday
+        next_monday = now + timedelta(days=days_until_next_monday)
+        next_week_start = next_monday.strftime("%A, %B %d, %Y")
         
-        # Check for tomorrow references
-        if any(re.search(pattern, message) for pattern in tomorrow_patterns):
-            return (True, "tomorrow", "tomorrow")
-            
-        # Check for today references
-        if any(re.search(pattern, message) for pattern in today_patterns):
-            return (True, "today", "today")
-            
-        # Check for this week references
-        if any(re.search(pattern, message) for pattern in this_week_patterns):
-            return (True, "this_week", "this week")
+        # Calculate this Friday for "end of week" reference
+        days_until_friday = (4 - now.weekday()) % 7
+        this_friday = now + timedelta(days=days_until_friday)
+        end_of_week = this_friday.strftime("%A, %B %d, %Y")
         
-        # Check for specific day references
-        for day_pattern in specific_day_patterns:
-            if re.search(day_pattern, message):
-                day = re.search(day_pattern, message).group(0)
-                return (True, "specific_day", day)
-                
-        # No specific date reference found
-        return (False, None, None)
+        # Current weekday name for reference
+        current_weekday = now.strftime("%A")
+
+        prompt = f"""
+Today is {today} ({current_weekday}).
+Tomorrow will be {tomorrow}.
+Next week starts on {next_week_start}.
+End of this week is {end_of_week}.
+
+Analyze this customer message and extract any date/time preferences for scheduling a meeting:
+"{message}"
+
+Return a JSON object with the following fields:
+1. "has_date_request": true if the message contains any date or time preferences, false otherwise
+2. "date_intent_type": one of these values: "today", "tomorrow", "this_week", "end_of_week", "next_week", "specific_day", "specific_date", "weekend", "custom", or null if no date request
+3. "date_description": a brief human-readable description of the requested time (e.g., "end of this week", "next Tuesday", etc.), or null if not specified
+4. "reasoning": a brief explanation of why you determined this date intent
+
+Be sure to understand contextual clues and natural language references to dates and times in ANY language.
+For example, "end of this week" should be interpreted as Thursday or Friday of the current week.
+
+Only return the JSON object without any other text.
+"""
+
+        logging.info(f"Date Intent Extraction Prompt: {prompt}")
+        response, _ = llm_think(prompt)
+        logging.info(f"Date Intent Extraction Response: {response}")
+        
+        try:
+            result = json.loads(response)
+            return result
+        except Exception as e:
+            logging.error(f"Error parsing date intent response: {e}")
+            # Return a default object if parsing fails
+            return {
+                "has_date_request": False,
+                "date_intent_type": None,
+                "date_description": None,
+                "reasoning": "Failed to parse LLM response"
+            }
     
     def schedule(self, lead_message: str):
         # Use CET timezone explicitly
@@ -56,23 +83,21 @@ class CalendarTool:
         next_monday = now + timedelta(days=days_until_next_monday)
         next_week_start = next_monday.strftime("%A, %B %d, %Y")
         
-        # Also provide a date 10 days out to give more context
-        future_date = now + timedelta(days=10)
-        future_date_str = future_date.strftime("%A, %B %d, %Y")
+        # Extract date intent using LLM
+        date_intent = self.extract_date_intent(lead_message)
+        has_date_request = date_intent.get("has_date_request", False)
+        date_intent_type = date_intent.get("date_intent_type")
+        date_description = date_intent.get("date_description")
+        reasoning = date_intent.get("reasoning", "")
         
-        # Detect if the message has a specific date intent
-        has_date_intent, intent_type, date_reference = self.detect_date_intent(lead_message)
+        # Log the date intent extraction for debugging
+        logging.info(f"Date intent extraction: {date_intent}")
         
         # Construct date guidance based on intent
-        if has_date_intent:
-            if intent_type == "tomorrow":
-                date_guidance = f"The customer specifically asked about meeting tomorrow ({tomorrow}). If possible, prioritize scheduling for tomorrow."
-            elif intent_type == "today":
-                date_guidance = f"The customer specifically asked about meeting today ({today}). If possible, prioritize scheduling for today."
-            elif intent_type == "this_week":
-                date_guidance = f"The customer specifically asked about meeting this week. Prioritize dates within this week if available."
-            elif intent_type == "specific_day":
-                date_guidance = f"The customer specifically asked about meeting on {date_reference}. Try to find a suitable time on that day."
+        if has_date_request and date_intent_type:
+            date_guidance = f"The customer specifically indicated a preference for {date_description}. " \
+                           f"The intent type is \"{date_intent_type}\". Reasoning: {reasoning}. " \
+                           f"Prioritize scheduling according to this preference."
         else:
             date_guidance = f"No specific date was requested. The meeting should ideally be scheduled for next week starting from {next_week_start} or later."
 
@@ -84,7 +109,7 @@ A customer sent the following message:
 \"\"\"{lead_message}\"\"\"
 
 {date_guidance}
-Consider normal business hours (9 AM - 5 PM CET) and avoid weekends.
+Consider normal business hours (9 AM - 5 PM CET) and avoid weekends unless specifically requested.
 
 DO NOT INCLUDE "CET" or "CEST" in your datetime response as it will cause parsing errors.
 
@@ -92,7 +117,8 @@ Return a response in valid JSON format with the following fields:
 1. "datetime": the suggested date and time in the format "Monday, April 28, 2025 at 10:00 AM" (without timezone indicator)
 2. "mode": the mode of the meeting (online or in-person)
 3. "subject": a relevant subject line for the meeting based on the message
-4. "has_specific_date_request": true if the customer requested a specific date, false otherwise
+4. "has_specific_date_request": {str(has_date_request).lower()}
+5. "date_intent_type": "{date_intent_type if date_intent_type else ''}"
 
 Only return the JSON object without any other text.
 """
