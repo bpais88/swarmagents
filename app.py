@@ -6,6 +6,9 @@ import os
 import requests
 import logging
 from dotenv import load_dotenv
+import pytz
+from datetime import datetime, timedelta
+import pandas as pd
 
 # Load environment variables from .env
 load_dotenv()
@@ -184,72 +187,75 @@ if st.button("Run Agent Workflow") and lead_text:
         st.subheader("Meeting Confirmation")
         st.markdown(report["meeting"])
         
-        # Display detailed calendar events for debugging
-        if "event_details" in report and report["event_details"]:
-            st.subheader("Your Calendar Events")
+        # Display the details behind the scheduling decision
+        st.subheader("📅 Calendar Scheduling Logic")
+        
+        # Show current time in CET
+        cet = pytz.timezone('Europe/Paris')
+        now = datetime.now(cet)
+        st.info(f"Current time: {now.strftime('%A, %B %d, %Y at %I:%M %p')} CET")
+        
+        # Display date recognition if found
+        if "thoughts" in report:
+            for thought in report["thoughts"]:
+                if "Customer requested a specific date/time:" in thought:
+                    st.success(thought)
+                elif "Prioritizing the requested date:" in thought:
+                    st.success(thought)
+                elif "No specific date requested, defaulting to next week" in thought:
+                    st.warning(thought)
+        
+        # Explain the scheduling strategy
+        st.markdown("""
+        ### Scheduling Strategy
+        - **NEW:** The calendar agent now detects and prioritizes specific date requests (e.g., "tomorrow", "next Monday")
+        - When no specific date is requested, meetings are scheduled for next week or later
+        - The agent avoids scheduling on days with all-day events
+        - Business hours are from 9 AM to 5 PM CET
+        """)
+        
+        # Calculate and show next Monday
+        days_until_next_monday = (7 - now.weekday()) % 7
+        if days_until_next_monday == 0:
+            days_until_next_monday = 7  # If today is Monday, go to next Monday
+        next_monday = now + timedelta(days=days_until_next_monday)
+        st.success(f"Next week starts: {next_monday.strftime('%A, %B %d, %Y')}")
+        
+        # Show all checked dates
+        if "all_checked_dates" in report and report["all_checked_dates"]:
+            st.subheader("Dates Checked for Availability")
+            date_tabs = st.tabs([info["formatted_date"] for date, info in report["all_checked_dates"].items()])
             
-            st.markdown("""
-            The agent checked your Google Calendar for the next few days to find the best meeting time.
-            Below are all the events in your calendar that were considered during scheduling.
-            """)
-            
-            # Create tabs for each checked date
-            date_tabs = st.tabs([date_info["formatted_date"] for date_str, date_info in sorted(report["event_details"].items())])
-            
-            for i, (date_str, date_info) in enumerate(sorted(report["event_details"].items())):
+            for i, (date, info) in enumerate(report["all_checked_dates"].items()):
                 with date_tabs[i]:
-                    formatted_date = date_info["formatted_date"]
-                    events = date_info["events"]
-                    
-                    if events:
-                        # Create a colorful table of events
-                        event_table = """
-                        <table style="width:100%; border-collapse: collapse;">
-                            <tr style="background-color: #f0f0f0;">
-                                <th style="padding: 8px; text-align: left; border: 1px solid #ddd;">Event</th>
-                                <th style="padding: 8px; text-align: left; border: 1px solid #ddd;">Time</th>
-                                <th style="padding: 8px; text-align: left; border: 1px solid #ddd;">Type</th>
-                            </tr>
-                        """
+                    # Display events for this date if available
+                    if date in report["event_details"] and report["event_details"][date]:
+                        events = report["event_details"][date]
+                        st.markdown(f"#### {len(events)} events on {info['formatted_date']}")
                         
-                        for j, event in enumerate(events):
-                            # Alternate row colors
-                            row_color = "#f9f9f9" if j % 2 == 0 else "white"
+                        # Create a DataFrame for better display
+                        if events:
+                            df = pd.DataFrame(events)
                             # Highlight full-day events
-                            if event["is_full_day"]:
-                                row_color = "#ffdddd"  # Light red for full-day events
-                                time_str = "All day"
-                                event_type = "Full-day event"
-                            else:
-                                time_str = f"{event['start']} to {event['end']}"
-                                event_type = "Timed event"
-                                
-                            event_table += f"""
-                            <tr style="background-color: {row_color};">
-                                <td style="padding: 8px; text-align: left; border: 1px solid #ddd;">{event['title']}</td>
-                                <td style="padding: 8px; text-align: left; border: 1px solid #ddd;">{time_str}</td>
-                                <td style="padding: 8px; text-align: left; border: 1px solid #ddd;">{event_type}</td>
-                            </tr>
-                            """
+                            def highlight_full_day(row):
+                                if row.is_full_day:
+                                    return ['background-color: #ffcccc'] * len(row)
+                                return [''] * len(row)
                             
-                        event_table += "</table>"
-                        st.markdown(event_table, unsafe_allow_html=True)
-                        
-                        # Highlight if this is the chosen meeting date
-                        if formatted_date == report.get("meeting_date"):
-                            if any(event["is_full_day"] for event in events):
-                                st.warning("This date has full-day events that may conflict with your meeting.")
-                            else:
-                                st.success("Meeting scheduled on this day in a free time slot between the events above.")
+                            st.dataframe(df.style.apply(highlight_full_day, axis=1), use_container_width=True)
+                        else:
+                            st.info("No events on this day.")
+                            
+                    # Show busy slots
+                    if "busy_slots" in info and info["busy_slots"]:
+                        st.markdown("#### Busy Time Slots")
+                        st.dataframe(pd.DataFrame(info["busy_slots"]), use_container_width=True)
                     else:
-                        st.markdown(f"No events found in your calendar for {formatted_date}.")
-                        if formatted_date == report.get("meeting_date"):
-                            st.success("Meeting scheduled on this day as your calendar was completely free.")
-            
-            # Overall explanation
-            selected_date = report.get("meeting_date", "")
-            if selected_date:
-                st.info(f"Based on this calendar analysis, the agent selected **{selected_date}** for your meeting.")
+                        st.success("No busy time slots on this day.")
+                        
+                    # Show if date was marked as fully booked
+                    if info.get("has_full_day_events", False):
+                        st.warning("⚠️ This date has one or more full-day events.")
         
         # Legacy display based on busy slots
         elif "all_checked_dates" in report and report["all_checked_dates"]:

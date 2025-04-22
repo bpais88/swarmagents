@@ -1,6 +1,6 @@
 import os
 import json
-import datetime
+from datetime import datetime, timedelta, date, time
 import pytz
 import logging
 from dotenv import load_dotenv
@@ -36,10 +36,14 @@ class GoogleCalendarOAuthTool:
 
         self.calendar_id = "primary"
 
-    def get_events(self, date: datetime.date):
+    def get_events(self, date: date):
         """Get detailed event information for a specific date including titles and full-day events."""
-        start_time = datetime.datetime.combine(date, datetime.time.min).replace(tzinfo=pytz.utc)
-        end_time = datetime.datetime.combine(date, datetime.time.max).replace(tzinfo=pytz.utc)
+        # Use CET timezone for consistency
+        cet_tz = pytz.timezone('Europe/Paris')
+        start_time = datetime.combine(date, time.min)
+        start_time = cet_tz.localize(start_time)
+        end_time = datetime.combine(date, time.max)
+        end_time = cet_tz.localize(end_time)
         
         try:
             events_result = self.service.events().list(
@@ -47,7 +51,8 @@ class GoogleCalendarOAuthTool:
                 timeMin=start_time.isoformat(),
                 timeMax=end_time.isoformat(),
                 singleEvents=True,
-                orderBy='startTime'
+                orderBy='startTime',
+                timeZone='Europe/Paris'  # Explicitly request CET/CEST
             ).execute()
             
             events = events_result.get('items', [])
@@ -66,14 +71,14 @@ class GoogleCalendarOAuthTool:
                     
                     if is_full_day:
                         # Full-day event spans the entire day
-                        start_dt = datetime.datetime.fromisoformat(start.get('date')).replace(
+                        start_dt = datetime.fromisoformat(start.get('date')).replace(
                             hour=0, minute=0, second=0).replace(tzinfo=pytz.utc)
-                        end_dt = datetime.datetime.fromisoformat(end.get('date')).replace(
+                        end_dt = datetime.fromisoformat(end.get('date')).replace(
                             hour=23, minute=59, second=59).replace(tzinfo=pytz.utc)
                     else:
                         # Regular event with specific times
-                        start_dt = datetime.datetime.fromisoformat(start.get('dateTime').replace('Z', '+00:00'))
-                        end_dt = datetime.datetime.fromisoformat(end.get('dateTime').replace('Z', '+00:00'))
+                        start_dt = datetime.fromisoformat(start.get('dateTime').replace('Z', '+00:00'))
+                        end_dt = datetime.fromisoformat(end.get('dateTime').replace('Z', '+00:00'))
                     
                     # Log each event we're processing
                     logging.info(f"Processing event: '{event.get('summary')}', full day: {is_full_day}, start: {start_dt}, end: {end_dt}")
@@ -93,10 +98,14 @@ class GoogleCalendarOAuthTool:
             logging.error(f"Error fetching events: {e}")
             return []
             
-    def get_busy_slots(self, date: datetime.date):
+    def get_busy_slots(self, date: date):
         """Get busy time slots for a specific date using the freebusy query."""
-        start_time = datetime.datetime.combine(date, datetime.time.min).replace(tzinfo=pytz.utc)
-        end_time = datetime.datetime.combine(date, datetime.time.max).replace(tzinfo=pytz.utc)
+        # Use CET timezone for consistency
+        cet_tz = pytz.timezone('Europe/Paris')
+        start_time = datetime.combine(date, time.min)
+        start_time = cet_tz.localize(start_time)
+        end_time = datetime.combine(date, time.max)
+        end_time = cet_tz.localize(end_time)
 
         # First get all events to handle full-day events properly
         events = self.get_events(date)
@@ -132,7 +141,7 @@ class GoogleCalendarOAuthTool:
             "timeMin": start_time.isoformat(),
             "timeMax": end_time.isoformat(),
             "items": [{"id": self.calendar_id}],
-            "timeZone": "UTC"
+            "timeZone": "Europe/Paris"
         }
 
         try:
@@ -146,8 +155,8 @@ class GoogleCalendarOAuthTool:
             for slot in busy:
                 try:
                     api_slots.append({
-                        "start": datetime.datetime.fromisoformat(slot["start"].replace("Z", "+00:00")),
-                        "end": datetime.datetime.fromisoformat(slot["end"].replace("Z", "+00:00")),
+                        "start": datetime.fromisoformat(slot["start"].replace("Z", "+00:00")),
+                        "end": datetime.fromisoformat(slot["end"].replace("Z", "+00:00")),
                     })
                 except Exception as e:
                     logging.warning(f"Couldn't parse busy slot: {e}")
@@ -177,7 +186,7 @@ class GoogleCalendarOAuthTool:
             # Fall back to the manually created list
             return manual_busy_slots
 
-    def is_slot_free(self, start: datetime.datetime, end: datetime.datetime, busy_slots):
+    def is_slot_free(self, start: datetime, end: datetime, busy_slots):
         """Check if a time slot is free (not overlapping with any busy slots)."""
         for slot in busy_slots:
             # If there's any overlap between the proposed slot and a busy slot
@@ -187,10 +196,18 @@ class GoogleCalendarOAuthTool:
         logging.info(f"Slot is free: {start} to {end}")
         return True
 
-    def find_next_free_slot(self, preferred_start: datetime.datetime, duration_minutes=30, busy_slots=[]):
+    def find_next_free_slot(self, preferred_start: datetime, duration_minutes=30, busy_slots=[]):
         """Find the next available time slot starting from a preferred time."""
         logging.info(f"🔎 Searching for free slot starting from: {preferred_start}")
 
+        # Make sure preferred_start is in CET for consistency 
+        if preferred_start.tzinfo is None or preferred_start.tzinfo.utcoffset(preferred_start) is None:
+            cet_tz = pytz.timezone('Europe/Paris')
+            preferred_start = cet_tz.localize(preferred_start)
+        elif preferred_start.tzinfo != pytz.timezone('Europe/Paris'):
+            # Convert to CET if in a different timezone
+            preferred_start = preferred_start.astimezone(pytz.timezone('Europe/Paris'))
+        
         # First check if there are any full-day events that block the entire day
         for slot in busy_slots:
             # If a slot spans the entire day or most of it (>12 hours), consider the day fully booked
@@ -200,7 +217,7 @@ class GoogleCalendarOAuthTool:
                 return None
 
         for offset_days in range(0, 7):  # Look ahead 1 week from preferred
-            current_day = preferred_start + datetime.timedelta(days=offset_days)
+            current_day = preferred_start + timedelta(days=offset_days)
             current_date = current_day.date()
             
             # Skip to the next day if we're not on the first iteration
@@ -225,7 +242,7 @@ class GoogleCalendarOAuthTool:
                     
                 # Try each hour
                 start = current_day.replace(hour=hour, minute=0, second=0, microsecond=0)
-                end = start + datetime.timedelta(minutes=duration_minutes)
+                end = start + timedelta(minutes=duration_minutes)
 
                 if self.is_slot_free(start, end, day_busy_slots):
                     logging.info(f"✅ Found available slot: {start}")
@@ -234,19 +251,26 @@ class GoogleCalendarOAuthTool:
         logging.warning("❌ No available slot found")
         return None
 
-    def create_event(self, summary: str, description: str, start_time: datetime.datetime, duration_minutes=30, location=""):
-        end_time = start_time + datetime.timedelta(minutes=duration_minutes)
+    def create_event(self, summary: str, description: str, start_time: datetime, duration_minutes=30, location=""):
+        end_time = start_time + timedelta(minutes=duration_minutes)
 
+        # Make sure times are in CET
+        if start_time.tzinfo is None or start_time.tzinfo.utcoffset(start_time) is None:
+            cet_tz = pytz.timezone('Europe/Paris')
+            start_time = cet_tz.localize(start_time)
+            end_time = cet_tz.localize(end_time)
+        
+        # Format event data
         event = {
             "summary": summary,
             "description": description,
             "start": {
                 "dateTime": start_time.isoformat(),
-                "timeZone": start_time.tzname() or "UTC",
+                "timeZone": "Europe/Paris",
             },
             "end": {
                 "dateTime": end_time.isoformat(),
-                "timeZone": end_time.tzname() or "UTC",
+                "timeZone": "Europe/Paris",
             },
             "location": location,
         }

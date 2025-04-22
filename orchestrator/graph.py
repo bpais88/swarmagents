@@ -6,7 +6,7 @@ from tools.google_calendar_tool import GoogleCalendarOAuthTool
 from utils.llm import llm_think
 from typing import TypedDict
 import json
-import datetime
+from datetime import datetime, timedelta, date, time
 import pytz
 import os
 import logging
@@ -56,27 +56,60 @@ Here is the message from the lead:
         raw_json = calendar_tool.schedule(lead_msg)
         try:
             data = json.loads(raw_json)
-            preferred_time = datetime.datetime.strptime(data["datetime"], "%A, %B %d, %Y at %I:%M %p")
-            preferred_time = preferred_time.replace(tzinfo=pytz.utc)
+            # Use CET timezone for parsing the preferred time - strip timezone info from string first 
+            cet_timezone = pytz.timezone('Europe/Paris')
+            
+            # Remove potential CET/CEST timezone suffix from datetime string to prevent parsing errors
+            datetime_str = data["datetime"]
+            if " CET" in datetime_str or " CEST" in datetime_str:
+                datetime_str = datetime_str.replace(" CET", "").replace(" CEST", "")
+                
+            preferred_time = datetime.strptime(datetime_str, "%A, %B %d, %Y at %I:%M %p")
+            preferred_time = cet_timezone.localize(preferred_time)
             mode = data.get("mode", "online")
             subject = data.get("subject", "AI project discussion")
+            has_specific_date_request = data.get("has_specific_date_request", False)
         except Exception as e:
             report["thoughts"].append(f"[Calendar Agent] Failed to parse meeting data: {e}")
             return {"calendar_done": False}
 
-        # Get current time with timezone awareness
-        now = datetime.datetime.now(pytz.utc)
-
-        # Check multiple upcoming dates for availability (the next 5 days starting from today)
-        today = now.date()
+        # Get current time with CET timezone awareness
+        now = datetime.now(pytz.timezone('Europe/Paris'))
+        
+        # If there's a specific date request, we should respect it
+        if has_specific_date_request:
+            report["thoughts"].append(f"[Calendar Agent] Customer requested a specific date/time: {preferred_time.strftime('%A, %B %d, %Y at %I:%M %p %Z')}")
+            
+            # Start checking from the requested date
+            start_date = preferred_time.date()
+            report["thoughts"].append(f"[Calendar Agent] Prioritizing the requested date: {start_date.strftime('%A, %B %d, %Y')}")
+        else:
+            # Calculate next Monday for "next week" scheduling
+            days_until_next_monday = (7 - now.weekday()) % 7
+            if days_until_next_monday == 0:
+                days_until_next_monday = 7  # If today is Monday, go to next Monday
+            next_monday = now.date() + timedelta(days=days_until_next_monday)
+            
+            # Start checking from next Monday, not from today
+            start_date = next_monday
+            report["thoughts"].append(f"[Calendar Agent] No specific date requested, defaulting to next week starting: {start_date.strftime('%A, %B %d, %Y')}")
+        
+        # For debugging
+        report["thoughts"].append(f"[Calendar Agent] Current time: {now.strftime('%A, %B %d, %Y at %I:%M %p %Z')} ({now.tzname()})")
+        
+        # Log the suggested date from the LLM
+        report["thoughts"].append(f"[Calendar Agent] LLM suggested: {preferred_time.strftime('%A, %B %d, %Y at %I:%M %p %Z')} ({preferred_time.tzname()})")
+        
+        # Check multiple upcoming dates for availability (starting from next week)
         best_slot = None
         
         # Date exclusion list - dates that are fully booked with all-day events
         fully_booked_dates = []
         days_checked = 0
         
-        for i in range(7):  # Check today + next 6 days (increased range)
-            check_date = today + datetime.timedelta(days=i)
+        # Check 7 days starting from next Monday
+        for i in range(7):
+            check_date = start_date + timedelta(days=i)
             formatted_date = check_date.strftime("%A, %B %d, %Y")
             date_str = check_date.strftime("%Y-%m-%d")
             
@@ -86,25 +119,35 @@ Here is the message from the lead:
             # Check if there are any full-day events
             full_day_events = [event for event in events if event["is_full_day"]]
             
+            # Log all events for debugging
+            report["thoughts"].append(f"[Calendar Agent] Events for {formatted_date}:")
+            event_details_for_date = []
+            
+            for event in events:
+                event_type = "Full Day" if event["is_full_day"] else "Timed"
+                event_info = f" - [{event_type}] {event['title']}: {event['start'].strftime('%H:%M')} to {event['end'].strftime('%H:%M')}"
+                report["thoughts"].append(event_info)
+                logging.info(event_info)
+                event_details_for_date.append({
+                    "title": event["title"],
+                    "is_full_day": event["is_full_day"],
+                    "start": event["start"].strftime("%H:%M"),
+                    "end": event["end"].strftime("%H:%M")
+                })
+                
+            # Store for displaying in UI
+            report["event_details"][date_str] = event_details_for_date
+            report["all_checked_dates"][date_str] = {
+                "formatted_date": formatted_date,
+                "has_full_day_events": len(full_day_events) > 0,
+                "total_events": len(events)
+            }
+            
             # Use logging instead of print for better debug info
             logging.info(f"\n📅 Checking events for {formatted_date}")
             for event in events:
                 event_type = "Full Day" if event["is_full_day"] else "Timed"
                 logging.info(f" - [{event_type}] {event['title']}: {event['start'].strftime('%H:%M')} to {event['end'].strftime('%H:%M')}")
-            
-            # Store detailed events in report for UI
-            report["event_details"][date_str] = {
-                "formatted_date": formatted_date,
-                "events": [
-                    {
-                        "title": event["title"],
-                        "start": event["start"].strftime("%I:%M %p") if not event["is_full_day"] else "All day",
-                        "end": event["end"].strftime("%I:%M %p") if not event["is_full_day"] else "All day",
-                        "is_full_day": event["is_full_day"]
-                    } 
-                    for event in events
-                ]
-            }
             
             # Get busy slots for this date
             busy_slots = calendar_api.get_busy_slots(check_date)
@@ -118,16 +161,13 @@ Here is the message from the lead:
                 fully_booked_dates.append(check_date)
                 
             # Store busy slots in our report
-            report["all_checked_dates"][date_str] = {
-                "formatted_date": formatted_date,
-                "busy_slots": [
-                    {
-                        "start": slot["start"].strftime("%I:%M %p"),
-                        "end": slot["end"].strftime("%I:%M %p")
-                    } 
-                    for slot in busy_slots
-                ]
-            }
+            report["all_checked_dates"][date_str]["busy_slots"] = [
+                {
+                    "start": slot["start"].strftime("%I:%M %p"),
+                    "end": slot["end"].strftime("%I:%M %p")
+                } 
+                for slot in busy_slots
+            ]
             
             # Skip slot checking if the date is fully booked with all-day events
             if check_date in fully_booked_dates:
@@ -135,20 +175,14 @@ Here is the message from the lead:
                 continue
                 
             # Try to find a free slot on this day
-            if check_date == today:
-                # For today, start from current time + 1 hour (rounded up to nearest hour)
-                current_hour = now.hour
-                current_minute = now.minute
-                start_hour = current_hour + 1 if current_minute == 0 else current_hour + 2
-                start_hour = max(9, min(16, start_hour))  # Ensure it's within 9-16 range
-            else:
-                start_hour = 9  # Start from 9 AM for future days
-                
-            # Skip if we're already past working hours today
-            if check_date == today and start_hour >= 17:
-                continue
-                
-            test_time = datetime.datetime.combine(check_date, datetime.time(start_hour, 0)).replace(tzinfo=pytz.utc)
+            start_hour = 9  # Default start time
+            
+            # If this is the specifically requested date and time, use that time first
+            if has_specific_date_request and check_date == preferred_time.date():
+                start_hour = preferred_time.hour
+                report["thoughts"].append(f"[Calendar Agent] Checking availability at the requested time: {start_hour}:00")
+            
+            test_time = datetime.combine(check_date, time(start_hour, 0)).replace(tzinfo=pytz.utc)
             free_slot = calendar_api.find_next_free_slot(
                 preferred_start=test_time,
                 duration_minutes=30,
@@ -179,7 +213,7 @@ Here is the message from the lead:
                 
                 # Try the next 7 days beyond our initial range
                 for i in range(7, 14):
-                    check_date = today + datetime.timedelta(days=i)
+                    check_date = start_date + timedelta(days=i)
                     formatted_date = check_date.strftime("%A, %B %d, %Y")
                     date_str = check_date.strftime("%Y-%m-%d")
                     
@@ -189,7 +223,9 @@ Here is the message from the lead:
                     
                     if not full_day_events:
                         # Try to find a slot on this clear day
-                        test_time = datetime.datetime.combine(check_date, datetime.time(9, 0)).replace(tzinfo=pytz.utc)
+                        test_time = datetime.combine(check_date, time(9, 0)).replace(tzinfo=pytz.utc)
+                        
+                        # Get busy slots for this date
                         busy_slots = calendar_api.get_busy_slots(check_date)
                         
                         # Check if this date is fully booked
@@ -209,21 +245,20 @@ Here is the message from the lead:
                             report["thoughts"].append(f"[Calendar Agent] Found slot beyond initial range: {preferred_time.strftime('%A, %B %d, %Y at %I:%M %p')}")
                             
                             # Add this date to our checked dates
-                            report["event_details"][date_str] = {
-                                "formatted_date": formatted_date,
-                                "events": [
-                                    {
-                                        "title": event["title"],
-                                        "start": event["start"].strftime("%I:%M %p") if not event["is_full_day"] else "All day",
-                                        "end": event["end"].strftime("%I:%M %p") if not event["is_full_day"] else "All day",
-                                        "is_full_day": event["is_full_day"]
-                                    } 
-                                    for event in events
-                                ]
-                            }
+                            report["event_details"][date_str] = [
+                                {
+                                    "title": event["title"],
+                                    "is_full_day": event["is_full_day"],
+                                    "start": event["start"].strftime("%H:%M"),
+                                    "end": event["end"].strftime("%H:%M")
+                                } 
+                                for event in events
+                            ]
                             
                             report["all_checked_dates"][date_str] = {
                                 "formatted_date": formatted_date,
+                                "has_full_day_events": len(full_day_events) > 0,
+                                "total_events": len(events),
                                 "busy_slots": [
                                     {
                                         "start": slot["start"].strftime("%I:%M %p"),
@@ -244,7 +279,7 @@ Here is the message from the lead:
         
         # Verify the slot is free before creating the event
         slot_start = preferred_time
-        slot_end = slot_start + datetime.timedelta(minutes=30)
+        slot_end = slot_start + timedelta(minutes=30)
         
         if not calendar_api.is_slot_free(slot_start, slot_end, selected_busy_slots):
             report["thoughts"].append(f"[Calendar Agent] WARNING: The selected slot is not free. This would cause overbooking.")
