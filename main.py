@@ -1,1 +1,4 @@
-from orchestrator.graph import run_graph\n\nif __name__ == '__main__':\n    run_graph()\n
+from orchestrator.graph import run_graph
+
+if __name__ == '__main__':
+    run_graph()
