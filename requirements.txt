@@ -1,8 +1,9 @@
 openai
 crewai
-langgraph
+langgraph>=0.0.20
 python-dotenv
 streamlit
 google-api-python-client
 google-auth-httplib2
 google-auth-oauthlib
+langfuse>=2.0.0
