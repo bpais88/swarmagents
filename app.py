@@ -29,8 +29,8 @@ if "oauth_complete" not in st.session_state:
 if "access_token" not in st.session_state:
     st.session_state.access_token = None
 
-st.set_page_config(page_title="Lindy-style Swarm of Agents", layout="centered")
-st.title("Lindy-style Swarm of Agents")
+st.set_page_config(page_title="Swarm of Agents", layout="centered")
+st.title("Swarm of Agents")
 
 # Check for reset request
 reset_oauth = st.query_params.get("reset")
