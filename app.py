@@ -1,5 +1,5 @@
 import streamlit as st
-from orchestrator.graph import run_graph
+from orchestrator.graph import create_graph
 from memory.supabase_memory import memory
 from urllib.parse import urlencode
 import os
@@ -23,11 +23,13 @@ logging.basicConfig(
     ]
 )
 
-# Initialize session state for OAuth flow
-if "oauth_complete" not in st.session_state:
-    st.session_state.oauth_complete = False
-if "access_token" not in st.session_state:
-    st.session_state.access_token = None
+# Initialize session state - Remove graph interruption state vars
+if "oauth_complete" not in st.session_state: st.session_state.oauth_complete = False
+if "access_token" not in st.session_state: st.session_state.access_token = None
+# Remove: graph_state, graph_interrupted, workflow_running, final_report
+# Add state for HITL review UI
+if 'current_draft' not in st.session_state: st.session_state.current_draft = None
+if 'initial_report' not in st.session_state: st.session_state.initial_report = None # To store report for revision context
 
 st.set_page_config(page_title="Swarm of Agents", layout="centered")
 st.title("Swarm of Agents")
@@ -142,7 +144,7 @@ elif not st.session_state.oauth_complete:
         st.stop()
 
 # ----------------------------
-# Run Agent Workflow
+# Run Agent Workflow - Simplified Flow
 # ----------------------------
 
 st.markdown("""
@@ -150,47 +152,133 @@ Trigger the AI agent workflow to process a lead email, schedule a meeting, and l
 You can provide the lead email and the rule for how the agent should classify it.
 """)
 
-lead_text = st.text_area("Paste Lead Email", height=200)
+lead_text = st.text_area("Paste Lead Email", height=200, key="lead_text_input")
 lead_rule = st.text_input(
     "Lead Qualification Rule",
-    value="Consider it a lead if the sender asks for a meeting, demo, or pricing."
+    value="Consider it a lead if the sender asks for a meeting, demo, or pricing.",
+    key="lead_rule_input"
 )
 
-if st.button("Run Agent Workflow") and lead_text:
-    with st.spinner("Running agents..."):
-        report = run_graph(email_body=lead_text, lead_rule=lead_rule, access_token=st.session_state.access_token)
-
-    st.success("Workflow completed!")
-    
-    # DEBUG: Print report structure
-    st.json(report)
-
-    st.subheader("Agent Thoughts")
-    for thought in report["thoughts"]:
-        st.markdown(f"- {thought}")
-
-    st.subheader("Tools Used")
-    for tool in report["tools_used"]:
-        st.markdown(f"- {tool}")
-
-    st.subheader("Total Tokens Used")
-    st.markdown(f"**Tokens**: {report['tokens']}")
-
-    st.subheader("Draft Reply Email")
-    reply = memory.get("draft_reply")
-    if reply:
-        st.code(reply, language="markdown")
+# Button to start the initial workflow run
+if st.button("Run Agent Workflow", key="run_workflow_btn"):
+    if not st.session_state.get("access_token"):
+        st.warning("Please connect Google Calendar first.")
+    elif not st.session_state.lead_text_input:
+        st.warning("Please enter a lead email.")
     else:
-        st.markdown("_No reply was generated._")
+        with st.spinner("Running agent workflow..."):
+            try:
+                graph = create_graph()
+                initial_report_struct = { # Define initial structure for the run
+                    "thoughts": [], "tools_used": [], "meeting": None, "error": None,
+                    "agent_thoughts": {}, "agent_metrics": {}, "tokens": {"input": 0, "output": 0, "total": 0},
+                    "detailed_execution": {}
+                }
+                initial_state = {
+                    "lead_message": st.session_state.lead_text_input,
+                    "lead_rule": st.session_state.lead_rule_input,
+                    "access_token": st.session_state.access_token,
+                    "report": initial_report_struct
+                }
+                
+                # Invoke the graph - runs to completion
+                final_state = graph.invoke(initial_state)
+                
+                # Store the report and clear any previous draft for the UI
+                st.session_state.initial_report = final_state.get("report", {})
+                st.session_state.current_draft = memory.get("draft_reply") # Get latest draft from memory
+                st.success("Workflow completed!")
+                # No rerun needed here, results displayed below
 
-    if "meeting" in report:
-        st.subheader("Meeting Confirmation")
-        st.markdown(report["meeting"])
+            except Exception as e:
+                st.error(f"Error during workflow execution: {e}")
+                logging.error(f"Workflow execution error: {e}", exc_info=True)
+                st.session_state.initial_report = None # Clear report on error
+                st.session_state.current_draft = None # Clear draft on error
+
+# --- Display Results and Optional HITL Review ---
+if st.session_state.initial_report:
+    report = st.session_state.initial_report
+    # Display standard report sections (Thoughts, Tools, Tokens, Meeting Status)
+    st.subheader("Workflow Results")
+    st.markdown("**Agent Thoughts:**")
+    if report.get("thoughts"):
+         for thought in report["thoughts"]:
+             st.markdown(f"- {thought}")
+    else: st.markdown("_None_")
+    st.markdown("**Tools Used:**")
+    if report.get("tools_used"):
+        for tool in report["tools_used"]:
+            st.markdown(f"- {tool}")
+    else: st.markdown("_None_")
+    st.markdown("**Total Tokens Used:**")
+    st.json(report.get("tokens", {}))
+    st.markdown("**Meeting Status:**")
+    st.markdown(f"_{report.get('meeting', 'N/A')}_")
+    st.markdown("**Final Agent Metrics:**")
+    st.json(report.get("agent_metrics", {}))
+
+    # --- Human Review Section (Acts on completed draft) --- 
+    st.subheader("📧 Draft Reply Review")
+    # current_draft is already fetched from memory and stored in session state above
+    if st.session_state.current_draft:
+        st.code(st.session_state.current_draft, language="markdown")
         
-        # Display the details behind the scheduling decision
+        feedback = st.text_area("Provide feedback for revision (optional):", key="feedback_text_hitl")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            if st.button("✅ Approve Email", key="approve_btn_hitl"):
+                st.success("Email Approved! (Action not implemented)")
+                st.session_state.current_draft = None # Clear UI state
+                st.session_state.initial_report = None # Clear UI state
+                st.rerun()
+
+        with col2:
+            if st.button("🔄 Request Revision", key="revise_btn_hitl"):
+                if not feedback:
+                    st.warning("Please provide feedback for revision.")
+                else:
+                    with st.spinner("Revising draft..."):
+                        try:
+                            # Reconstruct meeting info from the *initial* report
+                            meeting_info_for_revision = {
+                                "error": report.get("error"),
+                                "meeting_time": report.get("meeting_time"), # Note: May need drilling into report structure
+                                "calendar_link": report.get("calendar_link"),
+                                "user_feedback": feedback
+                            }
+                            # Import and call agent directly
+                            from agents.reply_agent import generate_reply 
+                            # Ensure generate_reply uses 'user_feedback' key
+                            revision_result = generate_reply(meeting_info=meeting_info_for_revision)
+                            new_draft = revision_result.get("reply")
+                            if new_draft:
+                                 st.session_state.current_draft = new_draft # Update draft for display
+                                 memory.set("draft_reply", new_draft) # Update memory too
+                                 st.success("Draft revised. Review new version above.")
+                                 st.rerun() # Rerun to show the updated draft
+                            else:
+                                 st.error("Revision failed.")
+                        except Exception as revision_e:
+                            st.error(f"Error during revision: {revision_e}")
+                            logging.error(f"Revision error: {revision_e}", exc_info=True)
+                            
+        with col3:
+            if st.button("❌ Discard Draft", key="discard_btn_hitl"):
+                st.info("Draft discarded.")
+                st.session_state.current_draft = None
+                st.session_state.initial_report = None
+                memory.set("draft_reply", None) # Clear memory
+                st.rerun()
+                
+    else:
+        st.markdown("_No draft reply generated or available._")
+
+    # Display calendar analysis (using data from the initial report)
+    if report and report.get("busy_slots"):
         st.subheader("📅 Calendar Scheduling Logic")
-        
-        # Show current time in CET
         cet = pytz.timezone('Europe/Paris')
         now = datetime.now(cet)
         st.info(f"Current time: {now.strftime('%A, %B %d, %Y at %I:%M %p')} CET")
@@ -278,30 +366,9 @@ if st.button("Run Agent Workflow") and lead_text:
                         st.markdown(f"**Busy time slots on {formatted_date}:**")
                         for j, slot in enumerate(busy_slots, 1):
                             st.markdown(f"**Event {j}:** {slot['start']} to {slot['end']}")
-                        
-                        # Highlight if this is the chosen meeting date
-                        if formatted_date == report.get("meeting_date"):
-                            st.success("Meeting scheduled on this day in a free time slot that avoids the conflicts above.")
-                    else:
-                        st.markdown(f"No events found in your calendar for {formatted_date}.")
-                        if formatted_date == report.get("meeting_date"):
-                            st.success("Meeting scheduled on this day as your calendar was completely free.")
-            
-            # Overall explanation
-            selected_date = report.get("meeting_date", "")
-            if selected_date:
-                st.info(f"Based on this analysis, the agent selected **{selected_date}** as the best day for your meeting.")
-        
-        # Extremely basic legacy display
-        elif "busy_slots" in report and report["busy_slots"]:
-            st.subheader("Busy Calendar Events")
-            st.markdown(f"These are the busy events found in the calendar for **{report.get('meeting_date', 'the requested day')}**:")
-            
-            for i, slot in enumerate(report["busy_slots"], 1):
-                st.markdown(f"**Event {i}:** {slot['start']} to {slot['end']}")
-            
-            st.info("The agent scheduled your meeting in a free time slot avoiding these busy periods.")
-        elif "busy_slots" in report:
-            st.markdown("No conflicting events were found in your calendar for the requested date.")
-else:
-    st.warning("Please enter a lead email to run the workflow.")
+                    
+                    # Highlight if this is the chosen meeting date
+                    if formatted_date == report.get("meeting_date"):
+                        st.success("Meeting scheduled on this day in a free time slot that avoids the conflicts above.")
+        else:
+            st.warning("Please enter a lead email to run the workflow.")

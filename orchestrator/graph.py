@@ -5,19 +5,108 @@ from tools.calendar_tool import CalendarTool
 from tools.google_calendar_tool import GoogleCalendarOAuthTool
 from utils.llm import llm_think
 from utils.langfuse_logger import get_langfuse_handler
-from typing import TypedDict
+from typing import TypedDict, Optional, Annotated, Dict, Any
 import json
 from datetime import datetime, timedelta, date, time
 import pytz
 import os
 import logging
 
-# Define the state structure
+# Import agent functions
+from agents.inbox_agent import process_message
+from agents.calendar_agent import schedule_meeting
+from agents.crm_agent import log_lead
+from agents.reply_agent import generate_reply
+
+# --- Helper function & Reducer (DEFINED BEFORE GraphState) ---
+
+def deep_merge_dicts(dict1, dict2):
+    merged = dict1.copy()
+    for key, value2 in dict2.items():
+        if key in merged:
+            value1 = merged[key]
+            if isinstance(value1, dict) and isinstance(value2, dict):
+                merged[key] = deep_merge_dicts(value1, value2)
+            elif isinstance(value1, list) and isinstance(value2, list):
+                merged[key] = value1 + value2
+            elif isinstance(value1, (int, float)) and isinstance(value2, (int, float)) and \
+                 ("tokens" in key.lower() or "time_ms" in key.lower() or key in ["input", "output", "total"]):
+                 merged[key] = value1 + value2 
+            else:
+                merged[key] = value2
+        else:
+            merged[key] = value2
+    return merged
+
+def reduce_report_state(left: Dict[str, Any], right: Dict[str, Any]) -> Dict[str, Any]:
+    if left is None: return right
+    if right is None: return left
+    merged_report = left.copy()
+    merged_report["thoughts"] = left.get("thoughts", []) + right.get("thoughts", [])
+    merged_report["tools_used"] = left.get("tools_used", []) + right.get("tools_used", [])
+    merged_report["meeting"] = right.get("meeting") if right.get("meeting") is not None else left.get("meeting")
+    merged_report["error"] = right.get("error") if right.get("error") is not None else left.get("error")
+    left_agent_thoughts = left.get("agent_thoughts", {})
+    if not isinstance(left_agent_thoughts, dict): left_agent_thoughts = {}
+    right_agent_thoughts = right.get("agent_thoughts", {})
+    if not isinstance(right_agent_thoughts, dict): right_agent_thoughts = {}
+    merged_agent_thoughts = left_agent_thoughts.copy()
+    for agent, thoughts in right_agent_thoughts.items():
+        if not isinstance(thoughts, list): thoughts = [str(thoughts)]
+        merged_agent_thoughts[agent] = merged_agent_thoughts.get(agent, []) + thoughts
+    merged_report["agent_thoughts"] = merged_agent_thoughts
+    left_agent_metrics = left.get("agent_metrics", {})
+    if not isinstance(left_agent_metrics, dict): left_agent_metrics = {}
+    right_agent_metrics = right.get("agent_metrics", {})
+    if not isinstance(right_agent_metrics, dict): right_agent_metrics = {}
+    merged_agent_metrics = left_agent_metrics.copy()
+    for agent, metrics_right in right_agent_metrics.items():
+        if not isinstance(metrics_right, dict): continue
+        metrics_left = merged_agent_metrics.get(agent, {})
+        if not isinstance(metrics_left, dict): metrics_left = {}
+        merged_agent_metrics[agent] = {
+            "input_tokens": int(metrics_left.get("input_tokens", 0) or 0) + int(metrics_right.get("input", 0) or 0),
+            "output_tokens": int(metrics_left.get("output_tokens", 0) or 0) + int(metrics_right.get("output", 0) or 0),
+            "total_tokens": int(metrics_left.get("total_tokens", 0) or 0) + int(metrics_right.get("total", 0) or 0),
+            "execution_time_ms": int(metrics_left.get("execution_time_ms", 0) or 0) + int(metrics_right.get("execution_time_ms", 0) or 0),
+        }
+    merged_report["agent_metrics"] = merged_agent_metrics
+    global_input_tokens = 0
+    global_output_tokens = 0
+    global_total_tokens = 0
+    for agent_metrics_data in merged_agent_metrics.values():
+        if isinstance(agent_metrics_data, dict):
+            global_input_tokens += int(agent_metrics_data.get("input_tokens", 0) or 0)
+            global_output_tokens += int(agent_metrics_data.get("output_tokens", 0) or 0)
+            global_total_tokens += int(agent_metrics_data.get("total_tokens", 0) or 0)
+    merged_report["tokens"] = {
+        "input": global_input_tokens,
+        "output": global_output_tokens,
+        "total": global_total_tokens
+    }
+    left_detailed = left.get("detailed_execution", {})
+    if not isinstance(left_detailed, dict): left_detailed = {}
+    right_detailed = right.get("detailed_execution", {})
+    if not isinstance(right_detailed, dict): right_detailed = {}
+    merged_report["detailed_execution"] = deep_merge_dicts(left_detailed, right_detailed)
+    return merged_report
+
+# --- State Definition (Simplified for non-interrupting graph) ---
 class GraphState(TypedDict):
     lead_message: str
-    lead_rule: str
-    calendar_done: bool
-    reply_done: bool
+    lead_rule: Optional[str]
+    access_token: Optional[str] 
+    report: Annotated[Dict[str, Any], reduce_report_state] 
+    
+    # Flags/Data indicating completion of stages or data passing
+    calendar_done: Optional[bool]
+    crm_done: Optional[bool] 
+    calendar_link: Optional[str]
+    meeting_time: Optional[str]
+    meeting_type: Optional[str]
+    draft_reply: Optional[str] # Reply node output stored here
+
+    error: Optional[str]
 
 # Initialize Langfuse handler
 langfuse_handler = get_langfuse_handler()
@@ -58,267 +147,116 @@ def add_observation_safely(span, name, value=None, metadata=None):
     except Exception as e:
         logging.warning(f"Failed to log observation to Langfuse: {str(e)}")
 
-def run_graph(email_body: str, lead_rule: str, access_token: str):
-    # Start a new trace for the entire workflow
-    global trace
-    if langfuse_handler:
-        try:
-            trace = langfuse_handler.trace(
-                name="agent_workflow",
-                metadata={
-                    "email_length": len(email_body),
-                    "rule_length": len(lead_rule),
-                    "timestamp": datetime.now().isoformat()
-                }
-            )
-        except Exception as e:
-            logging.warning(f"Failed to create Langfuse trace: {str(e)}")
-            trace = None
-        
-    report = {"thoughts": [], "tools_used": [], "tokens": 0, "busy_slots": [], "all_checked_dates": {}, "event_details": {}}
-    calendar_api = GoogleCalendarOAuthTool(access_token=access_token)
-
-    def coordinator_node(state):
-        global trace
-        span = None
-        if trace:
-            try:
-                span = trace.span(name="coordinator_node")
-            except Exception as e:
-                logging.warning(f"Failed to create coordinator span: {str(e)}")
-            
-        email = {
-            "from": "lead@example.com",
-            "subject": email_body
+def inbox_node(state: GraphState):
+    """Node to process the inbox message."""
+    try:
+        result = process_message(
+            lead_message=state["lead_message"],
+            lead_rule=state.get("lead_rule")
+        )
+        partial_report = {
+            "thoughts": [result["thought"]],
+            "tools_used": result.get("tools_used", []),
+            "agent_thoughts": {"inbox_agent": [result["thought"]]} ,
+            "agent_metrics": {"inbox_agent": result.get("tokens", {}).copy()}
         }
-        report["tools_used"].append("EmailTool.read_email")
+        return {"report": partial_report}
+    except Exception as e:
+        logging.error(f"Error in inbox_node: {e}", exc_info=True)
+        return {"report": {"error": f"Inbox node error: {str(e)}"}}
 
-        prompt = f"""
-Use the following rule to decide if this is a qualified lead:
-{state['lead_rule']}
+def calendar_node(state: GraphState):
+    """Node to schedule the meeting."""
+    try:
+        result = schedule_meeting(
+            lead_message=state["lead_message"],
+            access_token=state.get("access_token")
+        )
+        partial_report = {
+            "thoughts": [result["thought"]],
+            "tools_used": result.get("tools_used", []),
+            "agent_thoughts": {"calendar_agent": [result["thought"]]} ,
+            "agent_metrics": {"calendar_agent": result.get("tokens", {}).copy()}
+        }
+        output_state = {"report": partial_report, "calendar_done": True}
+        if result.get("calendar_link"): output_state["calendar_link"] = result["calendar_link"]
+        if result.get("meeting_time"): output_state["meeting_time"] = result["meeting_time"]
+        if result.get("meeting_type"): output_state["meeting_type"] = result["meeting_type"]
+        if result.get("error"): 
+            partial_report["error"] = result["error"]
+            partial_report["meeting"] = f"Failed to schedule: {result['error']}"
+            output_state["error"] = result["error"]
+        return output_state
+    except Exception as e:
+        logging.error(f"Error in calendar_node: {e}", exc_info=True)
+        return {"report": {"error": f"Calendar node error: {str(e)}"}, "calendar_done": False}
 
-Here is the message from the lead:
-{state['lead_message']}
-"""
-        thought, tokens = llm_think(prompt)
-        report["thoughts"].append(f"[Inbox Agent] {thought}")
-        report["tokens"] += tokens
-        memory.set("lead", email)
+def crm_node(state: GraphState):
+    """Node to log lead to CRM."""
+    try:
+        result = log_lead(lead_message=state["lead_message"])
+        partial_report = {
+            "thoughts": [result["thought"]],
+            "tools_used": result.get("tools_used", []),
+            "agent_thoughts": {"crm_agent": [result["thought"]]} ,
+            "agent_metrics": {"crm_agent": result.get("tokens", {}).copy()}
+        }
+        if result.get("error"): partial_report["error"] = result["error"]
+        return {"report": partial_report, "crm_done": True}
+    except Exception as e:
+        logging.error(f"Error in crm_node: {e}", exc_info=True)
+        return {"report": {"error": f"CRM node error: {str(e)}"}, "crm_done": False}
+
+def reply_node(state: GraphState):
+    """Node to generate the draft reply and store it in state."""
+    try:
+        meeting_info = {
+            "calendar_link": state.get("calendar_link"),
+            "meeting_time": state.get("meeting_time"),
+            "meeting_type": state.get("meeting_type"),
+            "error": state.get("report", {}).get("error") or state.get("error"),
+            # No feedback passed via state in this non-looping version
+        }
+        # The generate_reply function saves to memory internally
+        result = generate_reply(meeting_info=meeting_info) 
+        partial_report = {
+            "thoughts": [result["thought"]],
+            "tools_used": result.get("tools_used", []),
+            "agent_thoughts": {"reply_agent": [result["thought"]]} ,
+            "agent_metrics": {"reply_agent": result.get("tokens", {}).copy()}
+        }
+        if result.get("error"): partial_report["error"] = result["error"]
         
-        if span:
-            add_observation_safely(
-                span,
-                name="coordinator_decision",
-                value=1,
-                metadata={"thought": thought, "tokens": tokens}
-            )
-        
+        # Return the final reply content in the state
         return {
-            "lead_message": email["subject"],
-            "lead_rule": state["lead_rule"]
+            "report": partial_report, 
+            "draft_reply": result.get("reply") 
         }
+    except Exception as e:
+        logging.error(f"Error in reply_node: {e}", exc_info=True)
+        return {"report": {"error": f"Reply node error: {str(e)}"}}
 
-    def calendar_node(state):
-        global trace
-        span = None
-        if trace:
-            try:
-                span = trace.span(name="calendar_node")
-            except Exception as e:
-                logging.warning(f"Failed to create calendar span: {str(e)}")
-            
-        lead = memory.get("lead")
-        lead_msg = state["lead_message"]
-
-        raw_json = calendar_tool.schedule(lead_msg)
-        try:
-            data = json.loads(raw_json)
-            # Use CET timezone for parsing the preferred time - strip timezone info from string first 
-            cet_timezone = pytz.timezone('Europe/Paris')
-            
-            # Remove potential CET/CEST timezone suffix from datetime string to prevent parsing errors
-            datetime_str = data["datetime"]
-            if " CET" in datetime_str or " CEST" in datetime_str:
-                datetime_str = datetime_str.replace(" CET", "").replace(" CEST", "")
-            
-            # Parse the datetime string - handle both possible formats
-            try:
-                # Try the full format first (output by calendar_tool): "Saturday, April 26, 2025 at 10:00 AM"
-                try:
-                    preferred_time = datetime.strptime(datetime_str, "%A, %B %d, %Y at %I:%M %p")
-                except ValueError:
-                    # Fall back to the simpler format: "2025-04-26 10:00"
-                    preferred_time = datetime.strptime(datetime_str, "%Y-%m-%d %H:%M")
-                    
-                # Add timezone info
-                preferred_time = cet_timezone.localize(preferred_time)
-                
-                # Format for display
-                formatted_time = preferred_time.strftime("%A, %B %d at %I:%M %p")
-                
-                report["thoughts"].append(f"[Calendar Agent] Scheduling event for {formatted_time}")
-                report["tools_used"].append("GoogleCalendarTool.check_availability")
-                report["event_details"]["datetime"] = formatted_time
-                
-                # Get additional event details from the data
-                duration = int(data.get("duration", 30))
-                report["event_details"]["duration"] = duration
-                title = data.get("title", "Meeting")
-                report["event_details"]["title"] = title
-                description = data.get("description", "")
-                report["event_details"]["description"] = description
-                location = data.get("location", "")
-                report["event_details"]["location"] = location
-                
-                # Create the calendar event
-                meeting_link = calendar_api.create_event(
-                    summary=title,
-                    description=f"Meeting requested via: {lead_msg}\n\n{description}",
-                    start_time=preferred_time,
-                    duration_minutes=duration,
-                    location=location
-                )
-                
-                # Store the meeting link
-                report["event_details"]["meeting_link"] = meeting_link
-                report["thoughts"].append(f"[Calendar Agent] Created calendar event: {meeting_link}")
-                
-                if span:
-                    add_observation_safely(
-                        span,
-                        name="calendar_scheduling",
-                        value=1,
-                        metadata={
-                            "datetime": formatted_time,
-                            "duration": duration,
-                            "title": title,
-                            "meeting_link": meeting_link
-                        }
-                    )
-                
-            except ValueError as e:
-                report["thoughts"].append(f"[Calendar Agent] Error parsing datetime: {e}")
-                if span:
-                    add_observation_safely(
-                        span,
-                        name="calendar_error",
-                        value=0,
-                        metadata={"error": str(e), "datetime_str": datetime_str}
-                    )
-                
-        except json.JSONDecodeError as e:
-            report["thoughts"].append(f"[Calendar Agent] Error parsing calendar response: {e}")
-            if span:
-                add_observation_safely(
-                    span,
-                    name="calendar_error",
-                    value=0,
-                    metadata={"error": str(e), "raw_response": raw_json}
-                )
-            
-        return {"calendar_done": True}
-
-    def reply_node(state):
-        global trace
-        span = None
-        if trace:
-            try:
-                span = trace.span(name="reply_node")
-            except Exception as e:
-                logging.warning(f"Failed to create reply span: {str(e)}")
-        
-        lead = memory.get("lead")
-        
-        # Check if we have event details to include in the reply
-        event_context = ""
-        if report["event_details"] and "datetime" in report["event_details"]:
-            event_time = report["event_details"]["datetime"]
-            event_title = report["event_details"].get("title", "Meeting")
-            event_duration = report["event_details"].get("duration", 30)
-            meeting_link = report["event_details"].get("meeting_link", "")
-            
-            event_context = f"""
-I have scheduled a {event_duration} minute {event_title} for {event_time}.
-"""
-            if meeting_link:
-                event_context += f"""
-You can view and add this event to your calendar using this link: {meeting_link}
-"""
-            
-            event_context += """
-Please let me know if this time works for you, or if you would prefer a different time.
-"""
-        
-        prompt = f"""Write a professional reply to the following lead message:
-
-{lead['subject']}
-
-{event_context}
-Assume you are a sales assistant responding to a potential customer interested in your product or service.
-
-If a meeting time has already been suggested in the context above, reference it in your reply instead of asking for a time preference.
-If a calendar link is provided, mention it in your reply and encourage them to add it to their calendar.
-"""
-        thought, tokens = llm_think(prompt)
-        report["thoughts"].append(f"[Reply Agent] {thought}")
-        report["tokens"] += tokens
-        memory.set("draft_reply", thought)
-        report["tools_used"].append("LLM Reply Generator")
-        
-        if span:
-            add_observation_safely(
-                span,
-                name="reply_generation",
-                value=1,
-                metadata={"reply_length": len(thought), "tokens": tokens}
-            )
-        
-        return {"reply_done": True}
-
-    # Build the graph
+# --- Graph Definition (Simplified Edges) ---
+def create_graph():
+    """Creates the LangGraph StateGraph (no HITL interruption)."""
     builder = StateGraph(GraphState)
-
-    # Add nodes
-    builder.add_node("coordinator", coordinator_node)
+    builder.add_node("inbox", inbox_node)
     builder.add_node("calendar", calendar_node)
+    builder.add_node("crm", crm_node) 
     builder.add_node("reply", reply_node)
+    # REMOVED: builder.add_node("human_review", human_review_node)
 
-    # Add edges
-    builder.add_edge("coordinator", "calendar")
+    builder.set_entry_point("inbox")
+    builder.add_edge("inbox", "calendar")
+    builder.add_edge("inbox", "crm")
     builder.add_edge("calendar", "reply")
-    builder.add_edge("reply", END)
-
-    # Set the entry point
-    builder.set_entry_point("coordinator")
-
-    # Compile the graph
-    graph = builder.compile()
-
-    # Run the graph with the new API
-    config = {
-        "lead_message": email_body,
-        "lead_rule": lead_rule,
-        "calendar_done": False,
-        "reply_done": False
-    }
-    for _ in graph.stream(config):
-        pass  # Process each state if needed
+    builder.add_edge("crm", "reply") 
+    # Reply node now goes directly to END
+    builder.add_edge("reply", END) 
     
-    if trace:
-        try:
-            add_observation_safely(
-                trace,
-                name="workflow_completion",
-                value=1,
-                metadata={
-                    "total_tokens": report["tokens"],
-                    "total_thoughts": len(report["thoughts"]),
-                    "tools_used": report["tools_used"]
-                }
-            )
-            if hasattr(trace, "end"):
-                trace.end()
-        except Exception as e:
-            logging.warning(f"Failed to end Langfuse trace: {str(e)}")
+    # REMOVED: Conditional edge
 
-    return report
+    # Compile WITHOUT interruption
+    return builder.compile()
+
+# The run_graph function is NOT needed here, app.py uses create_graph and invoke
